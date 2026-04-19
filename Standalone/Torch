@@ -1,0 +1,121 @@
+// ==================================================
+// Torch Toggle Macro
+// Nimble / Foundry item macro
+// - Confirm before lighting/extinguishing
+// - Toggle token light on/off
+// - On extinguish: consume 1 torch
+// - Delete item when quantity reaches 0
+// ==================================================
+
+const TORCH_FLAG = "torch-light-active";
+
+function getTokenForActor(actorDoc) {
+  const controlled = canvas.tokens.controlled[0];
+  if (controlled?.actor?.id === actorDoc?.id) return controlled;
+
+  const speaker = ChatMessage.getSpeaker();
+  if (speaker.token) {
+    const speakerToken = canvas.tokens.get(speaker.token);
+    if (speakerToken?.actor?.id === actorDoc?.id) return speakerToken;
+  }
+
+  return actorDoc?.getActiveTokens?.(true, true)?.[0]
+    ?? actorDoc?.getActiveTokens?.()[0]
+    ?? null;
+}
+
+async function confirmDialog(title, content) {
+  return await Dialog.confirm({
+    title,
+    content: `<p>${content}</p>`,
+    yes: () => true,
+    no: () => false,
+    defaultYes: false,
+    rejectClose: false
+  });
+}
+
+async function setTorchLightOn(token) {
+  await token.document.update({
+    light: {
+      dim: 6,
+      bright: 1,
+      color: "#f69a54",
+      alpha: 0.2,
+      angle: 360,
+      rotation: token.rotation,
+      animation: {
+        type: "torch",
+        speed: 2,
+        intensity: 5
+      }
+    }
+  });
+
+  await token.document.setFlag("world", TORCH_FLAG, true);
+}
+
+async function setTorchLightOff(token) {
+  await token.document.update({
+    light: {
+      dim: 0,
+      bright: 0,
+      color: null,
+      alpha: null,
+      animation: { type: null }
+    }
+  });
+
+  await token.document.unsetFlag("world", TORCH_FLAG);
+}
+
+if (typeof item === "undefined" || !item) {
+  ui.notifications.warn("This macro must be run from the Torch item.");
+  return;
+}
+
+if (typeof actor === "undefined" || !actor) {
+  ui.notifications.warn("No actor was found for this Torch item.");
+  return;
+}
+
+const token = getTokenForActor(actor);
+
+if (!token) {
+  ui.notifications.warn("Select your token on the map before using the torch.");
+  return;
+}
+
+const torchIsActive = !!token.document.getFlag("world", TORCH_FLAG);
+
+if (torchIsActive) {
+  const confirmed = await confirmDialog("Extinguish Torch", "Extinguish your torch?");
+  if (!confirmed) return;
+
+  await setTorchLightOff(token);
+
+  const currentQty = Number(item.system.quantity ?? 0);
+  const newQty = currentQty - 1;
+
+  if (newQty <= 0) {
+    await item.delete();
+    ui.notifications.info("You extinguish the torch. Your last torch is used up.");
+  } else {
+    await item.update({ "system.quantity": newQty });
+    ui.notifications.info(`You extinguish the torch. ${newQty} torch${newQty === 1 ? "" : "es"} remaining.`);
+  }
+
+} else {
+  const currentQty = Number(item.system.quantity ?? 0);
+
+  if (currentQty <= 0) {
+    ui.notifications.warn("You do not have any torches left.");
+    return;
+  }
+
+  const confirmed = await confirmDialog("Use Torch", "Use torch now?");
+  if (!confirmed) return;
+
+  await setTorchLightOn(token);
+  ui.notifications.info("Torch lit.");
+}
