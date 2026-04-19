@@ -1,0 +1,53 @@
+// ==================================================
+// Generic Consumable-on-Success Macro
+// Nimble / Foundry item macro
+// - Uses the item's own name in warnings/info
+// - Runs normal Nimble activation first
+// - Consumes 1 item only if activation completes
+// - If quantity reaches 0, deletes the item
+// - If the activation dialog is cancelled/closed, consumes nothing
+// ==================================================
+
+if (typeof item === "undefined" || !item) {
+  ui.notifications.warn("This macro must be run from an item.");
+  return;
+}
+
+if (typeof actor === "undefined" || !actor) {
+  ui.notifications.warn(`No actor was found for "${item?.name ?? "this item"}".`);
+  return;
+}
+
+const itemName = item.name ?? "this item";
+const currentQty = Number(item.system.quantity ?? 0);
+
+if (currentQty <= 0) {
+  ui.notifications.warn(`You do not have any ${itemName} left.`);
+  return;
+}
+
+let activationResult;
+
+try {
+  // Use Nimble's normal item activation flow.
+  // This should open the standard dialog/card flow for the item.
+  activationResult = await item.activate();
+} catch (err) {
+  console.error(`${itemName} activation failed or was cancelled.`, err);
+  return;
+}
+
+// If the activation was cancelled/closed, do not consume the item.
+if (!activationResult) return;
+
+// Re-read quantity in case something else changed it during activation.
+const latestQty = Number(item.system.quantity ?? currentQty);
+const newQty = latestQty - 1;
+
+if (newQty <= 0) {
+  await item.delete();
+  ui.notifications.info(`You use your last ${itemName}.`);
+} else {
+  await item.update({ "system.quantity": newQty });
+  ui.notifications.info(`${itemName} used. Remaining: ${newQty}.`);
+}
