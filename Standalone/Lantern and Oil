@@ -1,0 +1,191 @@
+// ==================================================
+// Lantern Toggle Macro
+// Nimble / Foundry item macro
+// - Confirm before lighting/extinguishing
+// - Toggle token light on/off
+// - On activation: charge 3 sp
+// - No oil item tracking
+// ==================================================
+
+const LANTERN_FLAG = "lantern-light-active";
+const ACTIVATION_COST_SP = 3;
+
+// ---------- helpers ----------
+function getTokenForActor(actorDoc) {
+  const controlled = canvas.tokens.controlled[0];
+  if (controlled?.actor?.id === actorDoc?.id) return controlled;
+
+  const speaker = ChatMessage.getSpeaker();
+  if (speaker.token) {
+    const speakerToken = canvas.tokens.get(speaker.token);
+    if (speakerToken?.actor?.id === actorDoc?.id) return speakerToken;
+  }
+
+  return actorDoc?.getActiveTokens?.(true, true)?.[0]
+    ?? actorDoc?.getActiveTokens?.()[0]
+    ?? null;
+}
+
+async function confirmDialog(title, content) {
+  return await Dialog.confirm({
+    title,
+    content: `<p>${content}</p>`,
+    yes: () => true,
+    no: () => false,
+    defaultYes: false,
+    rejectClose: false
+  });
+}
+
+function getCurrencyPath(actorDoc, denom) {
+  const candidates = [
+    `system.currency.${denom}`,
+    `system.currency.${denom}.value`,
+    `system.wealth.${denom}`,
+    `system.wealth.${denom}.value`,
+    `system.resources.currency.${denom}`,
+    `system.resources.currency.${denom}.value`
+  ];
+
+  for (const path of candidates) {
+    const value = foundry.utils.getProperty(actorDoc, path);
+    if (typeof value === "number") return path;
+  }
+
+  return null;
+}
+
+function getCurrencyValue(actorDoc, denom) {
+  const path = getCurrencyPath(actorDoc, denom);
+  if (!path) return 0;
+  return Number(foundry.utils.getProperty(actorDoc, path) ?? 0);
+}
+
+async function updateCurrency(actorDoc, updates) {
+  await actorDoc.update(updates);
+}
+
+async function spendSilverCost(actorDoc, silverCost) {
+  const spPath = getCurrencyPath(actorDoc, "sp");
+  const gpPath = getCurrencyPath(actorDoc, "gp");
+
+  if (!spPath || !gpPath) {
+    return {
+      ok: false,
+      reason: "Currency paths for GP/SP were not found on this actor."
+    };
+  }
+
+  let sp = getCurrencyValue(actorDoc, "sp");
+  let gp = getCurrencyValue(actorDoc, "gp");
+
+  const totalSp = sp + (gp * 10);
+  if (totalSp < silverCost) {
+    return {
+      ok: false,
+      reason: `Not enough funds. Need ${silverCost} sp.`
+    };
+  }
+
+  // Spend SP first, then convert GP if needed
+  if (sp >= silverCost) {
+    sp -= silverCost;
+  } else {
+    let remaining = silverCost - sp;
+    sp = 0;
+
+    const gpToBreak = Math.ceil(remaining / 10);
+    gp -= gpToBreak;
+    sp += gpToBreak * 10;
+
+    sp -= remaining;
+  }
+
+  await updateCurrency(actorDoc, {
+    [spPath]: sp,
+    [gpPath]: gp
+  });
+
+  return {
+    ok: true,
+    gp,
+    sp
+  };
+}
+
+async function setLanternLightOn(token) {
+  await token.document.update({
+    light: {
+      dim: 6,
+      bright: 1,
+      color: "#ffd27a",
+      alpha: 0.2,
+      angle: 360,
+      rotation: token.rotation,
+      animation: {
+        type: "torch",
+        speed: 1,
+        intensity: 3
+      }
+    }
+  });
+
+  await token.document.setFlag("world", LANTERN_FLAG, true);
+}
+
+async function setLanternLightOff(token) {
+  await token.document.update({
+    light: {
+      dim: 0,
+      bright: 0,
+      color: null,
+      alpha: null,
+      animation: { type: null }
+    }
+  });
+
+  await token.document.unsetFlag("world", LANTERN_FLAG);
+}
+
+// ---------- main ----------
+if (typeof item === "undefined" || !item) {
+  ui.notifications.warn("This macro must be run from the Lantern item.");
+  return;
+}
+
+if (typeof actor === "undefined" || !actor) {
+  ui.notifications.warn("No actor was found for this Lantern item.");
+  return;
+}
+
+const token = getTokenForActor(actor);
+
+if (!token) {
+  ui.notifications.warn("Select your token on the map before using the lantern.");
+  return;
+}
+
+const lanternIsActive = !!token.document.getFlag("world", LANTERN_FLAG);
+
+if (lanternIsActive) {
+  const confirmed = await confirmDialog("Extinguish Lantern", "Extinguish your lantern?");
+  if (!confirmed) return;
+
+  await setLanternLightOff(token);
+  ui.notifications.info("You extinguish the lantern.");
+} else {
+  const confirmed = await confirmDialog(
+    "Use Lantern",
+    `Use lantern now?<br><br>This activation costs ${ACTIVATION_COST_SP} sp.`
+  );
+  if (!confirmed) return;
+
+  const payment = await spendSilverCost(actor, ACTIVATION_COST_SP);
+  if (!payment.ok) {
+    ui.notifications.warn(payment.reason);
+    return;
+  }
+
+  await setLanternLightOn(token);
+  ui.notifications.info(`Lantern lit. ${ACTIVATION_COST_SP} sp spent.`);
+}
