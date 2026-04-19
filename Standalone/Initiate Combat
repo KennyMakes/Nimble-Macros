@@ -1,0 +1,212 @@
+// =======================================================
+// Nimble: Start combat with all player-owned tokens
+// - Installs the PC turn-based movement lock hook once per session
+// - Adds all visible player-owned tokens on the active scene to combat
+// - Starts combat on the current scene
+// - Monsters can be added manually afterward while players roll initiative
+//
+// Top constants:
+// INCLUDE_HIDDEN_PCS:
+//   false = only add visible player-owned tokens
+//   true  = also add hidden player-owned tokens
+//
+// START_COMBAT_IMMEDIATELY:
+//   true  = start combat after adding PCs - this auto rolls initiative for all players.
+//   false = only create/add PCs to combat without starting - players have to roll intiative
+// =======================================================
+
+(async () => {
+  if (!game.user.isGM) {
+    ui.notifications.warn("GM only.");
+    return;
+  }
+
+  if (!canvas?.scene) {
+    ui.notifications.warn("No active scene.");
+    return;
+  }
+
+  const INCLUDE_HIDDEN_PCS = false;
+  const START_COMBAT_IMMEDIATELY = false;
+
+  const LOCK_HOOK_KEY = "nimbleTurnBasedLockHook";
+
+  function isPCActor(actor) {
+    return !!actor?.hasPlayerOwner;
+  }
+
+  async function getSceneForCombat(combat) {
+    return combat?.scene ?? canvas.scene;
+  }
+
+  async function setLocksForCombat(combat) {
+    const scene = await getSceneForCombat(combat);
+    if (!scene) return;
+
+    const activeCombatant = combat?.combatant ?? null;
+    const activeTokenId = activeCombatant?.tokenId ?? null;
+    const activeActor = activeCombatant?.actor ?? null;
+
+    const updates = [];
+
+    for (const td of scene.tokens.contents) {
+      const actor = td.actor ?? game.actors.get(td.actorId);
+      if (!isPCActor(actor)) continue;
+
+      const shouldUnlock =
+        !!activeTokenId &&
+        td.id === activeTokenId &&
+        isPCActor(activeActor);
+
+      const nextLocked = !shouldUnlock;
+      if (td.locked !== nextLocked) {
+        updates.push({ _id: td.id, locked: nextLocked });
+      }
+    }
+
+    if (updates.length) {
+      await scene.updateEmbeddedDocuments("Token", updates);
+    }
+  }
+
+  async function unlockAllPCs(combat) {
+    const scene = await getSceneForCombat(combat);
+    if (!scene) return;
+
+    const updates = scene.tokens.contents
+      .filter(td => {
+        const actor = td.actor ?? game.actors.get(td.actorId);
+        return isPCActor(actor) && td.locked;
+      })
+      .map(td => ({ _id: td.id, locked: false }));
+
+    if (updates.length) {
+      await scene.updateEmbeddedDocuments("Token", updates);
+    }
+  }
+
+  function installTurnLockHookOnce() {
+    if (game[LOCK_HOOK_KEY]) return false;
+    game[LOCK_HOOK_KEY] = true;
+
+    Hooks.on("updateCombat", async (combat, changed) => {
+      try {
+        if (changed?.ended === true || combat?.ended === true) {
+          await unlockAllPCs(combat);
+          return;
+        }
+
+        if (
+          typeof changed?.turn !== "undefined" ||
+          typeof changed?.round !== "undefined" ||
+          typeof changed?.combatantId !== "undefined"
+        ) {
+          await setLocksForCombat(combat);
+        }
+      } catch (err) {
+        console.warn("Turn-based lock hook error:", err);
+      }
+    });
+
+    Hooks.on("combatTurn", async (combat) => {
+      try {
+        await setLocksForCombat(combat);
+      } catch (err) {
+        console.warn("combatTurn lock hook error:", err);
+      }
+    });
+
+    Hooks.on("deleteCombat", async (combat) => {
+      try {
+        await unlockAllPCs(combat);
+      } catch (err) {
+        console.warn("deleteCombat unlock hook error:", err);
+      }
+    });
+
+    return true;
+  }
+
+  async function getOrCreateSceneCombat() {
+    let combat =
+      game.combats.find(c => c.scene?.id === canvas.scene.id && !c.ended) ??
+      game.combats.find(c => c.scene?.id === canvas.scene.id) ??
+      null;
+
+    if (!combat || combat.ended) {
+      combat = await Combat.create({ scene: canvas.scene.id });
+    }
+
+    return combat;
+  }
+
+  async function addTokensToCombat(combat, tokenDocs) {
+    if (!tokenDocs.length) return 0;
+
+    const existingTokenIds = new Set(combat.combatants.map(c => c.tokenId));
+    const toAdd = tokenDocs.filter(td => !existingTokenIds.has(td.id));
+
+    if (!toAdd.length) return 0;
+
+    const tokenDocumentClass = CONFIG.Token?.documentClass;
+
+    if (typeof tokenDocumentClass?.createCombatants === "function") {
+      await tokenDocumentClass.createCombatants(toAdd, { combat });
+    } else {
+      await combat.createEmbeddedDocuments(
+        "Combatant",
+        toAdd.map(td => ({
+          tokenId: td.id,
+          actorId: td.actorId ?? td.actor?.id ?? null,
+          sceneId: canvas.scene.id
+        }))
+      );
+    }
+
+    return toAdd.length;
+  }
+
+  const pcTokenDocs = canvas.scene.tokens.contents.filter(td => {
+    const actor = td.actor ?? game.actors.get(td.actorId);
+    if (!isPCActor(actor)) return false;
+    if (!INCLUDE_HIDDEN_PCS && td.hidden) return false;
+    return true;
+  });
+
+  if (!pcTokenDocs.length) {
+    ui.notifications.warn("No matching player-owned tokens found on the active scene.");
+    return;
+  }
+
+  const hookWasInstalled = installTurnLockHookOnce();
+  const combat = await getOrCreateSceneCombat();
+  const addedCount = await addTokensToCombat(combat, pcTokenDocs);
+
+  // Lock all PCs immediately while combat is being set up.
+  await setLocksForCombat(combat);
+
+  const combatHasStarted = !!combat.started || (combat.round ?? 0) > 0;
+
+  if (START_COMBAT_IMMEDIATELY && !combatHasStarted && typeof combat.startCombat === "function") {
+    await combat.startCombat();
+    await setLocksForCombat(combat);
+  }
+
+  const parts = [];
+
+  if (hookWasInstalled) {
+    parts.push("Turn-based PC movement locking enabled.");
+  }
+
+  if (addedCount > 0) {
+    parts.push(`Added ${addedCount} player token(s) to combat.`);
+  } else {
+    parts.push("All player tokens were already in combat.");
+  }
+
+  if (START_COMBAT_IMMEDIATELY) {
+    parts.push("Combat started.");
+  }
+
+  ui.notifications.info(parts.join(" "));
+})();
