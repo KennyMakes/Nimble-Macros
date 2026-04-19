@@ -1,0 +1,236 @@
+//Attach this to the Lay on Hands Feature card
+
+const FOUNDATION_ID = "nimble-chat-foundation";
+const ITEM_FLAG_SCOPE = "world";
+const ITEM_FLAG_KEY = "featureTracker";
+const FEATURE_KEY = "layOnHands";
+
+if (!actor || !item) {
+  ui.notifications.error("Lay on Hands must be run from the feature card item macro.");
+  return;
+}
+
+const foundation = game.modules.get(FOUNDATION_ID)?.api;
+if (!foundation) {
+  ui.notifications.error("nimble-chat-foundation is not active.");
+  return;
+}
+
+function getTracker(itemDoc) {
+  return foundry.utils.deepClone(itemDoc.getFlag(ITEM_FLAG_SCOPE, ITEM_FLAG_KEY) ?? {});
+}
+
+async function setTracker(itemDoc, tracker) {
+  return itemDoc.setFlag(ITEM_FLAG_SCOPE, ITEM_FLAG_KEY, tracker);
+}
+
+function getActorLevel(actorDoc) {
+  const rollDataLevel = Number(actorDoc.getRollData?.()?.level);
+  const detailsLevel = Number(actorDoc.system?.details?.level);
+  const systemLevel = Number(actorDoc.system?.level);
+  return rollDataLevel || detailsLevel || systemLevel || 1;
+}
+
+function getLayOnHandsMax(actorDoc) {
+  return 5 * getActorLevel(actorDoc);
+}
+
+function getHpData(actorDoc) {
+  const hp = actorDoc.system?.attributes?.hp ?? {};
+  const value = Number(hp.value ?? hp.current ?? hp.hp ?? 0) || 0;
+  const max = Number(hp.max ?? hp.maximum ?? value) || value;
+  return { value, max };
+}
+
+function getSingleTarget() {
+  const targets = Array.from(game.user.targets ?? []);
+  if (targets.length !== 1) {
+    ui.notifications.warn("Target exactly 1 creature for Lay on Hands.");
+    return null;
+  }
+
+  const token = targets[0];
+  const targetActor = token?.actor;
+  if (!targetActor) {
+    ui.notifications.error("The targeted token does not have an actor.");
+    return null;
+  }
+
+  return { token, actor: targetActor };
+}
+
+async function ensureTracker() {
+  const currentTracker = getTracker(item);
+  const maxPool = getLayOnHandsMax(actor);
+
+  const base = {
+    version: 1,
+    featureKey: FEATURE_KEY,
+    resetType: "safeRest",
+    mode: "pool",
+    label: item.name ?? "Lay on Hands",
+    maxFormula: "5 * level",
+    max: maxPool,
+    current: maxPool,
+    state: {},
+    lastReset: {
+      combatId: game.combat?.id ?? null,
+      round: game.combat?.round ?? null,
+      turn: game.combat?.turn ?? null,
+      timestamp: Date.now()
+    }
+  };
+
+  const merged = foundry.utils.mergeObject(base, currentTracker, { inplace: false });
+  merged.max = maxPool;
+
+  if (merged.current == null || Number.isNaN(Number(merged.current))) {
+    merged.current = maxPool;
+  }
+
+  merged.current = Math.max(0, Math.min(Number(merged.current), maxPool));
+  await setTracker(item, merged);
+  return getTracker(item);
+}
+
+async function promptForAmount({ targetName, currentPool, maxPool, missingHp }) {
+  const recommended = Math.max(0, Math.min(currentPool, missingHp));
+  const defaultAmount = recommended > 0 ? recommended : Math.min(currentPool, maxPool);
+
+  return foundation.openFormDialog({
+    title: "Lay on Hands",
+    content: `
+      <form>
+        <div class="form-group">
+          <label>Target</label>
+          <div><strong>${foundation.escapeHtml(targetName)}</strong></div>
+        </div>
+        <div class="form-group">
+          <label>Healing Pool</label>
+          <div>${currentPool} / ${maxPool}</div>
+        </div>
+        <div class="form-group">
+          <label>Target Missing HP</label>
+          <div>${missingHp}</div>
+        </div>
+        <div class="form-group">
+          <label for="loh-amount">HP to restore</label>
+          <input
+            id="loh-amount"
+            name="amount"
+            type="number"
+            min="1"
+            max="${Math.max(1, currentPool)}"
+            step="1"
+            value="${Math.max(1, defaultAmount)}"
+            autofocus
+          />
+        </div>
+      </form>
+    `,
+    submitLabel: "Create Chat Card",
+    cancelLabel: "Cancel",
+    onSubmit: (html) => Number(html.find('[name="amount"]').val())
+  });
+}
+
+const targetData = getSingleTarget();
+if (!targetData) return;
+
+const tracker = await ensureTracker();
+const maxPool = Number(tracker.max) || getLayOnHandsMax(actor);
+const currentPool = Number(tracker.current) || 0;
+
+if (currentPool <= 0) {
+  ui.notifications.warn("Lay on Hands has no healing power remaining.");
+  return;
+}
+
+const targetActor = targetData.actor;
+const targetToken = targetData.token;
+const targetHp = getHpData(targetActor);
+const missingHp = Math.max(0, targetHp.max - targetHp.value);
+
+if (missingHp <= 0) {
+  ui.notifications.info(`${targetActor.name} is already at full HP.`);
+  return;
+}
+
+const requestedAmount = await promptForAmount({
+  targetName: targetActor.name,
+  currentPool,
+  maxPool,
+  missingHp
+});
+
+if (requestedAmount == null) return;
+
+const amount = Math.floor(Number(requestedAmount));
+if (!Number.isFinite(amount) || amount <= 0) {
+  ui.notifications.warn("Enter a valid healing amount.");
+  return;
+}
+
+if (amount > currentPool) {
+  ui.notifications.warn(`You only have ${currentPool} Lay on Hands remaining.`);
+  return;
+}
+
+const actualHealing = Math.min(amount, missingHp);
+if (actualHealing <= 0) {
+  ui.notifications.info(`${targetActor.name} cannot be healed right now.`);
+  return;
+}
+
+const newCurrent = Math.max(0, currentPool - amount);
+tracker.current = newCurrent;
+tracker.max = maxPool;
+await setTracker(item, tracker);
+
+const requestId = `loh-${foundry.utils.randomID()}`;
+
+await foundation.createRequestCard({
+  cardType: game.i18n.localize("NCF.LayOnHands.CardType") || "Lay on Hands Request",
+  icon: "fa-solid fa-hand-holding-medical",
+  actor,
+  visibility: "public",
+  body: [
+    `<strong>${foundation.escapeHtml(actor.name)}</strong> uses <strong>Lay on Hands</strong> and heals <strong>${foundation.escapeHtml(targetToken.name || targetActor.name)}</strong> for <strong>${actualHealing}</strong> HP!`,
+    `Lay on Hands Pool: ${currentPool} → ${newCurrent} / ${maxPool}`
+  ],
+  actions: [
+    {
+      action: "layOnHands.apply",
+      label: "Apply Healing",
+      permission: foundation.constants.PERMISSIONS.TARGET_OWNER_OR_GM,
+      style: "primary"
+    },
+    {
+      action: "layOnHands.undo",
+      label: "Undo",
+      permission: foundation.constants.PERMISSIONS.ACTOR_OWNER_OR_GM,
+      style: "secondary"
+    }
+  ],
+  data: {
+    feature: FEATURE_KEY,
+    featureItemUuid: item.uuid,
+    featureItemId: item.id,
+    actorUuid: actor.uuid,
+    actorId: actor.id,
+    targetUuid: targetActor.uuid,
+    targetActorUuid: targetActor.uuid,
+    targetActorId: targetActor.id,
+    targetTokenUuid: targetToken.document?.uuid ?? targetToken.uuid,
+    targetTokenId: targetToken.id,
+    targetName: targetToken.name || targetActor.name,
+    amountSpent: amount,
+    amountToHeal: actualHealing,
+    trackerBefore: currentPool,
+    trackerAfter: newCurrent,
+    trackerMax: maxPool,
+    requestId
+  }
+});
+
+ui.notifications.info(`Lay on Hands card created. ${newCurrent}/${maxPool} remaining.`);
