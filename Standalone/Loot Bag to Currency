@@ -1,0 +1,150 @@
+// ==================================================
+// Generic Found Currency Macro
+// Nimble / Foundry item macro
+// - Rolls configured currency
+// - Adds rolled currency to actor
+// - Sends private chat message to GM(s) and actor owner(s)
+// - Consumes 1 item
+// - Deletes item if quantity reaches 0
+// - No item.activate() call
+// ==================================================
+
+// ------------------------------
+// CONFIG - change these per item
+// ------------------------------
+const CP_FORMULA = "0";
+const SP_FORMULA = "2d6";
+const GP_FORMULA = "1d4";
+const MULTIPLIER = 1;
+
+// Optional override. Leave null to use item name.
+const LOOT_LABEL = null;
+
+// ------------------------------
+// Basic checks
+// ------------------------------
+if (typeof item === "undefined" || !item) {
+  ui.notifications.warn("This macro must be run from an item.");
+  return;
+}
+
+if (typeof actor === "undefined" || !actor) {
+  ui.notifications.warn(`No actor was found for "${item?.name ?? "this item"}".`);
+  return;
+}
+
+const itemName = item.name ?? "this item";
+const lootLabel = LOOT_LABEL ?? itemName;
+const currentQty = Number(item.system.quantity ?? 0);
+
+if (currentQty <= 0) {
+  ui.notifications.warn(`You do not have any ${itemName} left.`);
+  return;
+}
+
+// ------------------------------
+// Helpers
+// ------------------------------
+function asNumber(value) {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function rollAmount(formula) {
+  const trimmed = String(formula ?? "0").trim();
+  if (!trimmed || trimmed === "0") return 0;
+
+  const roll = await (new Roll(trimmed)).evaluate({ async: true });
+  return asNumber(roll.total);
+}
+
+function getCurrency(actor) {
+  const currency = foundry.utils.getProperty(actor, "system.currency") ?? {};
+  return {
+    cp: asNumber(currency.cp?.value),
+    sp: asNumber(currency.sp?.value),
+    gp: asNumber(currency.gp?.value),
+  };
+}
+
+function getWhisperRecipients(actor) {
+  const gmIds = game.users.filter(u => u.isGM).map(u => u.id);
+  const ownerIds = game.users
+    .filter(u => actor.testUserPermission?.(u, CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER))
+    .map(u => u.id);
+
+  return [...new Set([...gmIds, ...ownerIds])];
+}
+
+function formatCurrency({ cp = 0, sp = 0, gp = 0 }) {
+  const parts = [];
+  if (cp) parts.push(`${cp} cp`);
+  if (sp) parts.push(`${sp} sp`);
+  if (gp) parts.push(`${gp} gp`);
+  return parts.length ? parts.join(", ") : "no currency";
+}
+
+// ------------------------------
+// Roll currency
+// ------------------------------
+let foundCp = (await rollAmount(CP_FORMULA)) * MULTIPLIER;
+let foundSp = (await rollAmount(SP_FORMULA)) * MULTIPLIER;
+let foundGp = (await rollAmount(GP_FORMULA)) * MULTIPLIER;
+
+foundCp = asNumber(foundCp);
+foundSp = asNumber(foundSp);
+foundGp = asNumber(foundGp);
+
+// ------------------------------
+// Add currency to actor
+// ------------------------------
+const currentCurrency = getCurrency(actor);
+
+const newCurrency = {
+  cp: currentCurrency.cp + foundCp,
+  sp: currentCurrency.sp + foundSp,
+  gp: currentCurrency.gp + foundGp,
+};
+
+await actor.update({
+  "system.currency.cp.value": newCurrency.cp,
+  "system.currency.sp.value": newCurrency.sp,
+  "system.currency.gp.value": newCurrency.gp,
+});
+
+// ------------------------------
+// Private chat message
+// ------------------------------
+const foundText = formatCurrency({
+  cp: foundCp,
+  sp: foundSp,
+  gp: foundGp,
+});
+
+const whisperRecipients = getWhisperRecipients(actor);
+
+await ChatMessage.create({
+  speaker: ChatMessage.getSpeaker({ actor }),
+  whisper: whisperRecipients,
+  content: `
+    <div class="nimble-loot-result">
+      <h3>${lootLabel}</h3>
+      <p><strong>${actor.name}</strong> found <strong>${foundText}</strong>.</p>
+      <p>The currency was added to their current total.</p>
+    </div>
+  `
+});
+
+// ------------------------------
+// Consume item
+// ------------------------------
+const latestQty = Number(item.system.quantity ?? currentQty);
+const newQty = latestQty - 1;
+
+if (newQty <= 0) {
+  await item.delete();
+  ui.notifications.info(`You use your last ${itemName}.`);
+} else {
+  await item.update({ "system.quantity": newQty });
+  ui.notifications.info(`${itemName} used. Remaining: ${newQty}.`);
+}
