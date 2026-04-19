@@ -1,0 +1,39 @@
+// ==================================================
+// Generic Owned Item Macro Runner
+//
+// Purpose:
+// Runs the macro stored on an owned item from the actor using this hotbar macro.
+// This is useful when you want a hotbar button to trigger the actor's own item,
+// instead of accidentally calling a system item with the same name.
+//
+// Constants:
+// ITEM_NAME = the exact name of the owned item to find on the actor
+// ITEM_TYPE = the exact item type to match (examples: "feature", "spell", "object")
+// ==================================================
+
+const ITEM_NAME = "Lay on Hands";
+const ITEM_TYPE = "feature";
+
+const actorDoc =
+  canvas.tokens.controlled[0]?.actor ??
+  game.user.character;
+
+if (!actorDoc) {
+  ui.notifications.warn("Select your character token or assign a user character first.");
+  return;
+}
+
+const itemDoc = actorDoc.items.find(i =>
+  i.name === ITEM_NAME &&
+  i.type === ITEM_TYPE
+);
+
+if (!itemDoc) {
+  ui.notifications.error(
+    `${actorDoc.name} does not have an owned ${ITEM_TYPE} ${ITEM_NAME}.`
+  );
+  return;
+}
+
+// Run the owned item's macro, not a system-level item with the same name.
+await itemDoc.activate({ executeMacro: true });
