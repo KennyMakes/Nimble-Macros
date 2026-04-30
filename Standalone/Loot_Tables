@@ -1,0 +1,576 @@
+//This macro will allow the gm to choose a rollable table from a drop down list
+//A built-in, selectable scaling rule for the number of monsters slain
+//A target Actor for the find
+//The perception roll of the target Actor.
+
+if (!game.user.isGM) {
+  ui.notifications.warn("Run this loot macro as the GM.");
+  return;
+}
+
+const CHARACTER_TYPE = "character";
+const LOOT_ROOT_FOLDER_NAME = "Loot";
+const RECENT_CHAT_SCAN_LIMIT = 10;
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function sortByName(a, b) {
+  return a.name.localeCompare(b.name);
+}
+
+function htmlToText(html) {
+  const div = document.createElement("div");
+  div.innerHTML = html ?? "";
+  return (div.textContent || div.innerText || "").trim();
+}
+
+function getLootRootFolder() {
+  return game.folders.find(f =>
+    f.type === "RollTable" &&
+    String(f.name ?? "").trim().toLowerCase() === LOOT_ROOT_FOLDER_NAME.toLowerCase() &&
+    !f.folder
+  ) ?? null;
+}
+
+function getDefaultActorId(actors, prefillActorId = "") {
+  if (prefillActorId && actors.some(a => a.id === prefillActorId)) return prefillActorId;
+
+  const controlled = canvas?.tokens?.controlled?.[0]?.actor;
+  if (controlled && actors.some(a => a.id === controlled.id)) return controlled.id;
+
+  return "";
+}
+
+function getDefaultTableId(tables) {
+  return tables[0]?.id ?? "";
+}
+
+function getAuthorUser(message) {
+  return (
+    message.author ??
+    game.users.get(message.user?.id) ??
+    game.users.get(message.userId) ??
+    null
+  );
+}
+
+function extractMessageTotal(message) {
+  const total = Number(message?.rolls?.[0]?.total);
+  return Number.isFinite(total) ? total : null;
+}
+
+function messageLooksLikePerceptionCheck(message) {
+  if (message?.type !== "skillCheck") return false;
+
+  const flavor = String(message?.flavor ?? "").trim();
+  if (!flavor) return false;
+
+  if (!flavor.toLowerCase().includes("perception check")) return false;
+
+  const total = Number(message?.rolls?.[0]?.total);
+  return Number.isFinite(total);
+}
+
+function findActorFromMessage(message, actors) {
+  const flavor = String(message?.flavor ?? "").trim();
+  if (!flavor) return null;
+
+  const actorNameFromFlavor = flavor.split(":")[0]?.trim();
+  if (!actorNameFromFlavor) return null;
+
+  // Exact match first
+  let actor = actors.find(a => a.name === actorNameFromFlavor);
+  if (actor) return actor;
+
+  // Case-insensitive exact match fallback
+  actor = actors.find(a => a.name?.toLowerCase() === actorNameFromFlavor.toLowerCase());
+  if (actor) return actor;
+
+  return null;
+}
+
+function getRecentPerceptionPrefill(actors) {
+  const recent = game.messages.contents.slice(-RECENT_CHAT_SCAN_LIMIT).reverse();
+
+  for (const message of recent) {
+    const author = getAuthorUser(message);
+    if (author?.isGM) continue;
+    if (!messageLooksLikePerceptionCheck(message)) continue;
+
+    const total = extractMessageTotal(message);
+    if (!Number.isFinite(total)) continue;
+
+    const actor = findActorFromMessage(message, actors);
+    const flavor = String(message?.flavor ?? "").trim();
+    const actorNameFromFlavor = flavor.split(":")[0]?.trim() || "";
+
+    return {
+      actorId: actor?.id ?? "",
+      actorName: actor?.name ?? actorNameFromFlavor,
+      rollValue: total,
+      messageId: message.id,
+      authorName: author?.name ?? "Unknown Player"
+    };
+  }
+
+  return null;
+}
+
+async function buildNestedTableRoll(table) {
+  const formula = String(table.formula || "1d100").trim();
+  const roll = new Roll(formula);
+  await roll.evaluate({ async: true });
+  return roll;
+}
+
+async function getResultDocument(result) {
+  const uuid =
+    result.documentUuid ||
+    result.documentUUID ||
+    (
+      result.documentCollection && result.documentId
+        ? `${result.documentCollection}.${result.documentId}`
+        : null
+    );
+
+  if (!uuid) return null;
+
+  try {
+    return await fromUuid(uuid);
+  } catch (err) {
+    console.warn("Loot macro: failed to resolve result UUID.", uuid, result, err);
+    return null;
+  }
+}
+
+function isLockedResult(result) {
+  return result?.drawn === true;
+}
+
+function getUnlockedResultsMatchingTotal(table, total) {
+  return table.results.contents.filter(result => {
+    if (isLockedResult(result)) return false;
+
+    const range = result.range ?? [];
+    const min = Number(range[0]);
+    const max = Number(range[1]);
+
+    return Number.isFinite(min) && Number.isFinite(max) && total >= min && total <= max;
+  });
+}
+
+async function drawLeafItemsFromMatchedResults(results, drawLog, parentTableName = "Manual Match") {
+  const items = [];
+
+  for (const result of results) {
+    const doc = await getResultDocument(result);
+    if (!doc) continue;
+
+    if (doc instanceof RollTable) {
+      const nestedItems = await drawLeafItemsFromTable(doc, drawLog);
+      items.push(...nestedItems);
+      continue;
+    }
+
+    if (doc.documentName === "Item" || doc instanceof Item) {
+      items.push(doc);
+      continue;
+    }
+
+    console.warn(`Loot macro: unsupported result document "${doc.documentName}" from "${parentTableName}".`, doc);
+  }
+
+  return items;
+}
+
+async function resolveTopLevelTableWithValue(table, rollValue, drawLog) {
+  const matchedResults = getUnlockedResultsMatchingTotal(table, rollValue);
+
+  drawLog.push({
+    table: table.name,
+    formula: "manual value",
+    total: rollValue,
+    modeLabel: "Top Level Value",
+    results: matchedResults.map(r => r.text || r.name || "Unknown")
+  });
+
+  if (!matchedResults.length) {
+    ui.notifications.warn(`No unlocked results matched ${rollValue} on "${table.name}".`);
+    return [];
+  }
+
+  return await drawLeafItemsFromMatchedResults(matchedResults, drawLog, table.name);
+}
+
+async function drawLeafItemsFromTable(table, drawLog) {
+  const MAX_ATTEMPTS = 100;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const roll = await buildNestedTableRoll(table);
+    const matchedResults = getUnlockedResultsMatchingTotal(table, roll.total);
+
+    drawLog.push({
+      table: table.name,
+      formula: roll.formula,
+      total: roll.total,
+      modeLabel: attempt === 1 ? "Nested Roll" : `Nested Reroll ${attempt}`,
+      results: matchedResults.map(r => r.text || r.name || "Unknown")
+    });
+
+    if (matchedResults.length) {
+      return await drawLeafItemsFromMatchedResults(matchedResults, drawLog, table.name);
+    }
+  }
+
+  ui.notifications.warn(`No unlocked results remain on "${table.name}".`);
+  return [];
+}
+
+async function findTierSubtable(parentTable, tierName) {
+  const tier = tierName.toLowerCase();
+
+  for (const result of parentTable.results.contents) {
+    const doc = await getResultDocument(result);
+    if (doc instanceof RollTable && doc.name.toLowerCase().includes(tier)) {
+      return doc;
+    }
+  }
+
+  return null;
+}
+
+function cloneItemDataForActor(itemDoc) {
+  const data = foundry.utils.deepClone(itemDoc.toObject());
+
+  delete data._id;
+  delete data.folder;
+  delete data.sort;
+  delete data.ownership;
+
+  return data;
+}
+
+function getIncomingQuantity(itemData) {
+  const qty = Number(itemData?.system?.quantity);
+  return Number.isFinite(qty) && qty > 0 ? qty : 1;
+}
+
+function findStackTarget(actor, itemData) {
+  const incomingHasQty = Number.isFinite(Number(itemData?.system?.quantity));
+  if (!incomingHasQty) return null;
+
+  return actor.items.find(i =>
+    i.name === itemData.name &&
+    i.type === itemData.type &&
+    Number.isFinite(Number(i.system?.quantity))
+  ) ?? null;
+}
+
+function consolidateSummary(rows) {
+  const map = new Map();
+
+  for (const row of rows) {
+    const key = `${row.name}||${row.img || ""}`;
+    const existing = map.get(key) || { name: row.name, img: row.img, qty: 0 };
+    existing.qty += row.qty;
+    map.set(key, existing);
+  }
+
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function addItemsToActor(actor, itemDocs) {
+  const added = [];
+
+  for (const itemDoc of itemDocs) {
+    const itemData = cloneItemDataForActor(itemDoc);
+    const qty = getIncomingQuantity(itemData);
+    const stackTarget = findStackTarget(actor, itemData);
+
+    if (stackTarget) {
+      const currentQty = Number(stackTarget.system?.quantity ?? 0);
+      await stackTarget.update({ "system.quantity": currentQty + qty });
+      added.push({
+        name: stackTarget.name,
+        img: stackTarget.img,
+        qty
+      });
+      continue;
+    }
+
+    const created = await actor.createEmbeddedDocuments("Item", [itemData]);
+    const createdItem = created?.[0];
+
+    added.push({
+      name: createdItem?.name ?? itemData.name,
+      img: createdItem?.img ?? itemData.img,
+      qty
+    });
+  }
+
+  return consolidateSummary(added);
+}
+
+function getActorOwnerUserIds(actor) {
+  const ownerLevel = CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER;
+
+  return game.users
+    .filter(u => !u.isGM && actor.testUserPermission(u, ownerLevel))
+    .map(u => u.id);
+}
+
+function getWhisperRecipients(actor) {
+  const gmIds = game.users.filter(u => u.isGM).map(u => u.id);
+  const ownerIds = getActorOwnerUserIds(actor);
+  return [...new Set([...gmIds, ...ownerIds])];
+}
+
+function getScaleLabel(scaleMode) {
+  switch (scaleMode) {
+    case "small": return "Small Find";
+    case "standard": return "Standard Find (+1 Weak)";
+    case "large-solid": return "Large Find (+1 Solid)";
+    case "large-weak2": return "Large Find (+2 Weak)";
+    default: return scaleMode;
+  }
+}
+
+async function postLootWhisper({ actor, sourceTable, addedSummary, drawLog, scaleMode, rollValue, prefill }) {
+  const whisper = getWhisperRecipients(actor);
+
+  const itemList = addedSummary.length
+    ? addedSummary.map(entry => `
+      <li>
+        <img src="${escapeHtml(entry.img || "icons/svg/item-bag.svg")}" width="24" height="24" style="vertical-align:middle; margin-right:6px; border:0;">
+        <strong>${escapeHtml(entry.name)}</strong>${entry.qty > 1 ? ` ×${entry.qty}` : ""}
+      </li>
+    `).join("")
+    : `<li>No item documents were resolved from the roll.</li>`;
+
+  const rollDetails = drawLog.map(log => {
+    return `<li><strong>${escapeHtml(log.table)}</strong> (${escapeHtml(log.modeLabel)}): ${escapeHtml(log.formula)} = ${escapeHtml(log.total)} → ${escapeHtml((log.results || []).join(", ") || "No matches")}</li>`;
+  }).join("");
+
+  const prefillLine = prefill
+    ? `<p><strong>Recent Check Used:</strong> ${escapeHtml(prefill.actorName || "Unknown Actor")} — ${escapeHtml(prefill.rollValue)} (${escapeHtml(prefill.authorName)})</p>`
+    : "";
+
+  const content = `
+    <div>
+      <h2>Loot Received</h2>
+      <p><strong>Actor:</strong> ${escapeHtml(actor.name)}</p>
+      <p><strong>Source Table:</strong> ${escapeHtml(sourceTable.name)}</p>
+      <p><strong>Scale:</strong> ${escapeHtml(getScaleLabel(scaleMode))}</p>
+      <p><strong>Roll Value:</strong> ${escapeHtml(rollValue)}</p>
+      ${prefillLine}
+
+      <hr>
+
+      <ul>
+        ${itemList}
+      </ul>
+
+      <details>
+        <summary><strong>Roll Details</strong></summary>
+        <ul>
+          ${rollDetails || "<li>No roll details recorded.</li>"}
+        </ul>
+      </details>
+    </div>
+  `;
+
+  await ChatMessage.create({
+    speaker: ChatMessage.getSpeaker({ actor }),
+    whisper,
+    content
+  });
+}
+
+async function promptForLootConfig(actors, tables, prefill) {
+  const defaultActorId = getDefaultActorId(actors, prefill?.actorId ?? "");
+  const actorOptions = [
+    `<option value="" ${defaultActorId ? "" : "selected"}>— Select Actor —</option>`,
+    ...actors.map(a => `<option value="${a.id}" ${a.id === defaultActorId ? "selected" : ""}>${escapeHtml(a.name)}</option>`)
+  ].join("");
+
+  const defaultRollValue = Number.isFinite(Number(prefill?.rollValue)) ? Number(prefill.rollValue) : "";
+  const tableOptions = tables
+    .map(t => `<option value="${t.id}" ${t.id === getDefaultTableId(tables) ? "selected" : ""}>${escapeHtml(t.name)}</option>`)
+    .join("");
+
+  const prefillSummary = prefill
+    ? `<p style="margin-top:8px;"><strong>Recent Perception Check Found:</strong> ${escapeHtml(prefill.actorName || "Unknown Actor")} rolled <strong>${escapeHtml(prefill.rollValue)}</strong> (${escapeHtml(prefill.authorName)})</p>`
+    : `<p style="margin-top:8px;"><strong>No recent player Perception check found</strong> in the last ${RECENT_CHAT_SCAN_LIMIT} chat messages.</p>`;
+
+  const content = `
+    <form>
+      <div class="form-group">
+        <label>Loot Table</label>
+        <select name="tableId">${tableOptions}</select>
+      </div>
+      <div class="form-group">
+        <label>Scale Rule</label>
+        <select name="scaleMode">
+          <option value="small">Small Find — normal result only</option>
+          <option value="standard" selected>Standard Find — normal result + 1 Weak</option>
+          <option value="large-solid">Large Find — normal result + 1 Solid</option>
+          <option value="large-weak2">Large Find — normal result + 2 Weak</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Target Actor</label>
+        <select name="actorId">${actorOptions}</select>
+      </div>
+      <div class="form-group">
+        <label>Roll Value</label>
+        <input type="number" step="1" name="rollValue" value="${escapeHtml(defaultRollValue)}" placeholder="Enter Perception total">
+      </div>
+      ${prefillSummary}
+      <p style="margin-top:8px;">
+        The top-level loot table uses this value directly.
+        Nested tables still roll their own formulas normally.
+      </p>
+    </form>
+  `;
+
+  return await new Promise(resolve => {
+    new Dialog({
+      title: "Award Loot from Roll Table",
+      content,
+      buttons: {
+        ok: {
+          label: "Roll Loot",
+          callback: html => {
+            const form = html[0].querySelector("form");
+            resolve(new FormDataExtended(form).object);
+          }
+        },
+        cancel: {
+          label: "Cancel",
+          callback: () => resolve(null)
+        }
+      },
+      default: "ok",
+      close: () => resolve(null)
+    }).render(true);
+  });
+}
+
+const actors = game.actors
+  .filter(a => a.type === CHARACTER_TYPE)
+  .sort(sortByName);
+
+const lootRootFolder = getLootRootFolder();
+
+if (!actors.length) {
+  ui.notifications.error("No character actors were found.");
+  return;
+}
+
+if (!lootRootFolder) {
+  ui.notifications.error('Could not find a root RollTable folder named "Loot".');
+  return;
+}
+
+const tables = game.tables.contents
+  .filter(t => t.folder?.id === lootRootFolder.id)
+  .sort(sortByName);
+
+if (!tables.length) {
+  ui.notifications.error('No rollable tables were found directly inside the root "Loot" folder.');
+  return;
+}
+
+const prefill = getRecentPerceptionPrefill(actors);
+const config = await promptForLootConfig(actors, tables, prefill);
+if (!config) return;
+
+const sourceTable = game.tables.get(config.tableId);
+const actor = game.actors.get(config.actorId);
+const scaleMode = config.scaleMode || "standard";
+const rollValue = Number(config.rollValue);
+
+if (!sourceTable) {
+  ui.notifications.error("Selected table could not be found.");
+  return;
+}
+
+if (!actor) {
+  ui.notifications.error("Select a target actor.");
+  return;
+}
+
+if (!Number.isFinite(rollValue)) {
+  ui.notifications.error("Enter a valid roll value.");
+  return;
+}
+
+const drawLog = [];
+const itemDocs = [];
+
+// Top-level table uses the provided roll value directly
+itemDocs.push(...await resolveTopLevelTableWithValue(sourceTable, rollValue, drawLog));
+
+// Scale-rule bonus rolls always use their own normal nested formulas
+if (scaleMode === "standard") {
+  const weakTable = await findTierSubtable(sourceTable, "Weak");
+  if (!weakTable) {
+    ui.notifications.warn(`No Weak subtable is directly linked from "${sourceTable.name}".`);
+  } else {
+    itemDocs.push(...await drawLeafItemsFromTable(weakTable, drawLog));
+  }
+}
+
+if (scaleMode === "large-solid") {
+  const solidTable = await findTierSubtable(sourceTable, "Solid");
+  if (!solidTable) {
+    ui.notifications.warn(`No Solid subtable is directly linked from "${sourceTable.name}".`);
+  } else {
+    itemDocs.push(...await drawLeafItemsFromTable(solidTable, drawLog));
+  }
+}
+
+if (scaleMode === "large-weak2") {
+  const weakTable = await findTierSubtable(sourceTable, "Weak");
+  if (!weakTable) {
+    ui.notifications.warn(`No Weak subtable is directly linked from "${sourceTable.name}".`);
+  } else {
+    itemDocs.push(...await drawLeafItemsFromTable(weakTable, drawLog));
+    itemDocs.push(...await drawLeafItemsFromTable(weakTable, drawLog));
+  }
+}
+
+if (!itemDocs.length) {
+  ui.notifications.warn("The table did not resolve to any Item documents.");
+  await postLootWhisper({
+    actor,
+    sourceTable,
+    addedSummary: [],
+    drawLog,
+    scaleMode,
+    rollValue,
+    prefill
+  });
+  return;
+}
+
+const addedSummary = await addItemsToActor(actor, itemDocs);
+
+await postLootWhisper({
+  actor,
+  sourceTable,
+  addedSummary,
+  drawLog,
+  scaleMode,
+  rollValue,
+  prefill
+});
+
+ui.notifications.info(`Awarded ${addedSummary.length} loot entr${addedSummary.length === 1 ? "y" : "ies"} to ${actor.name}.`);
