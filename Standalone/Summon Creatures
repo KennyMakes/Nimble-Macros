@@ -1,0 +1,487 @@
+// =======================================================
+// Nimble / Foundry v13: Generic Summon Macro
+// Attach this to any monster feature/item macro.
+// Click valid spaces to place summoned tokens.
+//
+// Safe for item/actor macro context:
+// - does NOT redeclare actor, token, or item
+// =======================================================
+
+// =====================
+// CONFIG
+// =====================
+
+// Actor UUID of the creature to summon.
+// Examples:
+// const SUMMON_ACTOR_UUID = "Actor.rabOhFKjKEe6QeEj";
+// const SUMMON_ACTOR_UUID = "Compendium.nimble.nimble-monsters.Actor.xxxxxxxxxxxxxxxx";
+const SUMMON_ACTOR_UUID = "Actor.rabOhFKjKEe6QeEj";
+
+// Maximum distance from summoner, in Nimble spaces.
+// Nimble uses spaces; diagonals count as 1 space in this macro.
+const MAX_SPACES_FROM_SUMMONER = 6;
+
+// Default number of creatures to summon.
+const DEFAULT_SUMMON_COUNT = 1;
+
+// If true, a dialog appears first asking how many creatures to summon.
+const ASK_SUMMON_COUNT_FIRST = false;
+
+// Dialog bounds, only used if ASK_SUMMON_COUNT_FIRST is true.
+const MIN_SUMMON_COUNT = 1;
+const MAX_SUMMON_COUNT = 12;
+
+// If false, summoned tokens cannot overlap visible tokens.
+const ALLOW_OCCUPIED_SPACE = false;
+
+// If true, summoned tokens copy the summoner token's disposition.
+const MATCH_SUMMONER_DISPOSITION = true;
+
+// If true, newly summoned tokens are controlled after placement.
+// For multiple summons, all newly summoned tokens will be controlled.
+const CONTROL_SUMMONS_AFTER_PLACEMENT = true;
+
+// If true and combat is active, summoned tokens are added to the current combat.
+// Leave false if you prefer adding them manually.
+const ADD_SUMMONS_TO_COMBAT = false;
+
+// If true, the chat message is whispered to GM only.
+const WHISPER_CHAT_TO_GM = false;
+
+// =====================
+// BASIC CHECKS
+// =====================
+
+if (!canvas?.ready || !canvas.scene) {
+  ui.notifications.warn("No active scene is ready.");
+  return;
+}
+
+if (!game.user.isGM) {
+  ui.notifications.warn("This macro creates scene tokens. Run as GM, or use a GM-executed trigger/socket workflow.");
+}
+
+// =====================
+// HELPERS
+// =====================
+
+function summonEsc(value) {
+  return foundry.utils.escapeHTML(String(value ?? ""));
+}
+
+function summonAsPlaceableToken(value) {
+  if (!value) return null;
+
+  // Token placeable
+  if (value.document && value.center) return value;
+
+  // TokenDocument
+  if (value.object?.document && value.object.center) return value.object;
+
+  return null;
+}
+
+function summonGetMacroActor() {
+  return typeof actor !== "undefined" ? actor : null;
+}
+
+function summonGetMacroToken() {
+  return typeof token !== "undefined" ? token : null;
+}
+
+function summonResolveSummonerToken() {
+  const macroToken = summonGetMacroToken();
+  const macroActor = summonGetMacroActor();
+
+  return (
+    summonAsPlaceableToken(macroToken) ??
+    canvas.tokens.controlled[0] ??
+    (macroActor ? canvas.tokens.placeables.find(t => t.actor?.id === macroActor.id) : null) ??
+    (game.user.character ? canvas.tokens.placeables.find(t => t.actor?.id === game.user.character.id) : null)
+  );
+}
+
+async function summonResolveActor(uuid) {
+  let summonedActor = await fromUuid(uuid).catch(() => null);
+
+  if (!summonedActor) {
+    const actorId = String(uuid ?? "").split(".").pop();
+    summonedActor = game.actors.get(actorId);
+  }
+
+  return summonedActor;
+}
+
+function summonTokenCenterFromTopLeft(x, y, width = 1, height = 1, gridSize) {
+  return {
+    x: x + (width * gridSize) / 2,
+    y: y + (height * gridSize) / 2
+  };
+}
+
+function summonSnapToTokenTopLeft(point, width = 1, height = 1, gridSize) {
+  return {
+    x: Math.round((point.x - (width * gridSize) / 2) / gridSize) * gridSize,
+    y: Math.round((point.y - (height * gridSize) / 2) / gridSize) * gridSize
+  };
+}
+
+// Nimble-style square-grid distance: diagonals count as 1 space.
+function summonDistanceInSpaces(a, b, gridSize) {
+  const dx = Math.abs(a.x - b.x) / gridSize;
+  const dy = Math.abs(a.y - b.y) / gridSize;
+  return Math.max(dx, dy);
+}
+
+function summonIsInsideScene(x, y, width = 1, height = 1, gridSize) {
+  const w = width * gridSize;
+  const h = height * gridSize;
+
+  return (
+    x >= 0 &&
+    y >= 0 &&
+    x + w <= canvas.dimensions.width &&
+    y + h <= canvas.dimensions.height
+  );
+}
+
+function summonRectanglesOverlap(a, b) {
+  return (
+    a.x < b.x + b.w &&
+    a.x + a.w > b.x &&
+    a.y < b.y + b.h &&
+    a.y + a.h > b.y
+  );
+}
+
+function summonIsOccupied(x, y, width = 1, height = 1, gridSize, summonerToken, alreadyPlanned = []) {
+  const candidate = {
+    x,
+    y,
+    w: width * gridSize,
+    h: height * gridSize
+  };
+
+  const overlapsExistingToken = canvas.tokens.placeables.some(t => {
+    if (t.id === summonerToken.id) return false;
+    if (t.document.hidden) return false;
+
+    const existing = {
+      x: t.document.x,
+      y: t.document.y,
+      w: Number(t.document.width ?? 1) * gridSize,
+      h: Number(t.document.height ?? 1) * gridSize
+    };
+
+    return summonRectanglesOverlap(candidate, existing);
+  });
+
+  if (overlapsExistingToken) return true;
+
+  const overlapsAlreadyPlanned = alreadyPlanned.some(p => {
+    const planned = {
+      x: p.x,
+      y: p.y,
+      w: width * gridSize,
+      h: height * gridSize
+    };
+
+    return summonRectanglesOverlap(candidate, planned);
+  });
+
+  return overlapsAlreadyPlanned;
+}
+
+function summonGetCanvasPointFromPointerEvent(event) {
+  const renderer = canvas.app.renderer;
+  const global = new PIXI.Point();
+
+  if (renderer.events?.mapPositionToPoint) {
+    renderer.events.mapPositionToPoint(global, event.clientX, event.clientY);
+  } else if (renderer.plugins?.interaction?.mapPositionToPoint) {
+    renderer.plugins.interaction.mapPositionToPoint(global, event.clientX, event.clientY);
+  } else {
+    const rect = canvas.app.view.getBoundingClientRect();
+    global.set(event.clientX - rect.left, event.clientY - rect.top);
+  }
+
+  const world = canvas.stage.worldTransform.applyInverse(global);
+  return { x: world.x, y: world.y };
+}
+
+async function summonWaitForPlacementClick({ index, total, summonerName, maxSpaces }) {
+  return new Promise(resolve => {
+    const view = canvas.app.view;
+
+    function cleanup() {
+      view.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
+    }
+
+    function onKeyDown(event) {
+      if (event.key !== "Escape") return;
+      cleanup();
+      resolve(null);
+    }
+
+    function onPointerDown(event) {
+      event.preventDefault();
+      event.stopPropagation();
+
+      // Right-click cancels.
+      if (event.button === 2) {
+        cleanup();
+        resolve(null);
+        return;
+      }
+
+      const point = summonGetCanvasPointFromPointerEvent(event);
+      cleanup();
+      resolve(point);
+    }
+
+    view.addEventListener("pointerdown", onPointerDown, { capture: true });
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+
+    ui.notifications.info(
+      `Summon ${index}/${total}: click a space within ${maxSpaces} spaces of ${summonerName}. Press Esc or right-click to cancel.`
+    );
+  });
+}
+
+async function summonAskCountDialog(defaultCount) {
+  if (!ASK_SUMMON_COUNT_FIRST) return defaultCount;
+
+  const safeDefault = Math.clamp(Number(defaultCount) || 1, MIN_SUMMON_COUNT, MAX_SUMMON_COUNT);
+
+  const content = `
+    <form>
+      <div class="form-group">
+        <label>Number to Summon</label>
+        <input
+          type="number"
+          name="count"
+          min="${MIN_SUMMON_COUNT}"
+          max="${MAX_SUMMON_COUNT}"
+          step="1"
+          value="${safeDefault}"
+          autofocus
+        />
+      </div>
+    </form>
+  `;
+
+  return await new Promise(resolve => {
+    let resolved = false;
+
+    const finish = value => {
+      if (resolved) return;
+      resolved = true;
+      resolve(value);
+    };
+
+    new Dialog({
+      title: "Summon Creatures",
+      content,
+      buttons: {
+        summon: {
+          label: "Summon",
+          icon: '<i class="fas fa-dragon"></i>',
+          callback: html => {
+            const form = html?.[0]?.querySelector?.("form") ?? html?.querySelector?.("form");
+            const raw = form?.elements?.count?.value;
+            const count = Math.clamp(Number.parseInt(raw, 10) || safeDefault, MIN_SUMMON_COUNT, MAX_SUMMON_COUNT);
+            finish(count);
+          }
+        },
+        cancel: {
+          label: "Cancel",
+          callback: () => finish(null)
+        }
+      },
+      default: "summon",
+      close: () => finish(null)
+    }).render(true);
+  });
+}
+
+async function summonPostChat({ summonerToken, summonedActor, count, createdDocs }) {
+  const img = summonedActor.img
+    ? `<img src="${summonedActor.img}" style="width:36px;height:36px;border:0;vertical-align:middle;margin-right:8px;">`
+    : "";
+
+  const content = `
+    <div class="nimble-summon-card">
+      <h3 style="margin:0 0 6px 0;">Summoned Creatures</h3>
+      <p style="margin:0;">
+        ${img}<strong>${summonEsc(summonerToken.name)}</strong> summons
+        <strong>${count} × ${summonEsc(summonedActor.name)}</strong>.
+      </p>
+    </div>
+  `;
+
+  const chatData = {
+    speaker: ChatMessage.getSpeaker({ actor: summonerToken.actor, token: summonerToken.document }),
+    content
+  };
+
+  if (WHISPER_CHAT_TO_GM) {
+    chatData.whisper = ChatMessage.getWhisperRecipients("GM").map(u => u.id);
+  }
+
+  await ChatMessage.create(chatData);
+}
+
+async function summonAddToCombat(createdDocs) {
+  if (!ADD_SUMMONS_TO_COMBAT) return;
+  if (!game.combat || game.combat.scene?.id !== canvas.scene.id) return;
+
+  const tokenIds = createdDocs.map(d => d.id).filter(Boolean);
+
+  const combatants = tokenIds.map(tokenId => ({
+    sceneId: canvas.scene.id,
+    tokenId,
+    hidden: false
+  }));
+
+  if (combatants.length) {
+    await game.combat.createEmbeddedDocuments("Combatant", combatants);
+  }
+}
+
+// =====================
+// MAIN
+// =====================
+
+const summonSummonerToken = summonResolveSummonerToken();
+
+if (!summonSummonerToken) {
+  ui.notifications.warn("Select the summoning actor's token first.");
+  return;
+}
+
+const summonTargetActor = await summonResolveActor(SUMMON_ACTOR_UUID);
+
+if (!summonTargetActor || summonTargetActor.documentName !== "Actor") {
+  ui.notifications.error(`Could not find summoned actor: ${SUMMON_ACTOR_UUID}`);
+  return;
+}
+
+const summonCount = await summonAskCountDialog(DEFAULT_SUMMON_COUNT);
+
+if (!summonCount) {
+  ui.notifications.info("Summon canceled.");
+  return;
+}
+
+const summonGridSize = canvas.grid.size;
+const summonWidth = Number(summonTargetActor.prototypeToken?.width ?? 1);
+const summonHeight = Number(summonTargetActor.prototypeToken?.height ?? 1);
+const summonOriginCenter = summonSummonerToken.center;
+
+const summonPlannedPlacements = [];
+const summonCreatedDocs = [];
+
+for (let i = 1; i <= summonCount; i++) {
+  while (true) {
+    const clickedPoint = await summonWaitForPlacementClick({
+      index: i,
+      total: summonCount,
+      summonerName: summonSummonerToken.name,
+      maxSpaces: MAX_SPACES_FROM_SUMMONER
+    });
+
+    if (!clickedPoint) {
+      ui.notifications.info(`Summon canceled after placing ${summonCreatedDocs.length}/${summonCount}.`);
+      if (summonCreatedDocs.length) {
+        await summonPostChat({
+          summonerToken: summonSummonerToken,
+          summonedActor: summonTargetActor,
+          count: summonCreatedDocs.length,
+          createdDocs: summonCreatedDocs
+        });
+      }
+      return;
+    }
+
+    const snapped = summonSnapToTokenTopLeft(clickedPoint, summonWidth, summonHeight, summonGridSize);
+
+    const summonCenter = summonTokenCenterFromTopLeft(
+      snapped.x,
+      snapped.y,
+      summonWidth,
+      summonHeight,
+      summonGridSize
+    );
+
+    const distance = summonDistanceInSpaces(summonOriginCenter, summonCenter, summonGridSize);
+
+    if (!summonIsInsideScene(snapped.x, snapped.y, summonWidth, summonHeight, summonGridSize)) {
+      ui.notifications.warn("That placement is outside the scene. Choose another space.");
+      continue;
+    }
+
+    if (distance > MAX_SPACES_FROM_SUMMONER) {
+      ui.notifications.warn(
+        `That space is ${distance.toFixed(1)} spaces away. Choose a space within ${MAX_SPACES_FROM_SUMMONER} spaces.`
+      );
+      continue;
+    }
+
+    if (
+      !ALLOW_OCCUPIED_SPACE &&
+      summonIsOccupied(
+        snapped.x,
+        snapped.y,
+        summonWidth,
+        summonHeight,
+        summonGridSize,
+        summonSummonerToken,
+        summonPlannedPlacements
+      )
+    ) {
+      ui.notifications.warn("That space is occupied. Choose an open space.");
+      continue;
+    }
+
+    const tokenOverrides = {
+      x: snapped.x,
+      y: snapped.y
+    };
+
+    if (MATCH_SUMMONER_DISPOSITION) {
+      tokenOverrides.disposition = summonSummonerToken.document.disposition;
+    }
+
+    const tokenDoc = await summonTargetActor.getTokenDocument(tokenOverrides);
+    const tokenData = tokenDoc.toObject();
+
+    const [created] = await canvas.scene.createEmbeddedDocuments("Token", [tokenData]);
+
+    summonCreatedDocs.push(created);
+    summonPlannedPlacements.push({ x: snapped.x, y: snapped.y });
+
+    ui.notifications.info(`Summoned ${summonTargetActor.name} (${i}/${summonCount}).`);
+    break;
+  }
+}
+
+if (CONTROL_SUMMONS_AFTER_PLACEMENT && summonCreatedDocs.length) {
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  canvas.tokens.releaseAll();
+
+  for (const doc of summonCreatedDocs) {
+    const placedToken = doc.object ?? canvas.tokens.get(doc.id);
+    placedToken?.control({ releaseOthers: false });
+  }
+}
+
+await summonAddToCombat(summonCreatedDocs);
+
+await summonPostChat({
+  summonerToken: summonSummonerToken,
+  summonedActor: summonTargetActor,
+  count: summonCreatedDocs.length,
+  createdDocs: summonCreatedDocs
+});
