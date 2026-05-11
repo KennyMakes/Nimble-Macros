@@ -118,7 +118,7 @@ async function setLanternLightOn(token) {
     light: {
       dim: 6,
       bright: 1,
-      color: "#ffd27a",
+      color: "#ff8d00",
       alpha: 0.2,
       angle: 360,
       rotation: token.rotation,
@@ -165,7 +165,7 @@ if (!token) {
   return;
 }
 
-const lanternIsActive = !!token.document.getFlag("world", LANTERN_FLAG);
+const lanternIsActive = !!actor.getFlag("world", LANTERN_FLAG);
 
 if (lanternIsActive) {
   const confirmed = await confirmDialog("Extinguish Lantern", "Extinguish your lantern?");
