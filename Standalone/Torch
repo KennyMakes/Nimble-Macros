@@ -86,7 +86,7 @@ if (!token) {
   return;
 }
 
-const torchIsActive = !!token.document.getFlag("world", TORCH_FLAG);
+const torchIsActive = !!actor.getFlag("world", TORCH_FLAG);
 
 if (torchIsActive) {
   const confirmed = await confirmDialog("Extinguish Torch", "Extinguish your torch?");
